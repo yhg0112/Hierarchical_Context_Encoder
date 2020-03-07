@@ -18,7 +18,7 @@ from tensor2tensor.models.transformer import transformer_ffn_layer, features_to_
 
 from tensor2tensor.models.transformer import transformer_base_single_gpu
 
-from models import transformer_with_contexts_layers
+from . import transformer_with_contexts_layers
 
 import tensorflow as tf
 
