@@ -42,11 +42,11 @@ class TransformerWithContexts(Transformer):
         return super(TransformerWithContexts, self).body(features)
 
     def _fast_decode(self,
-                 features,
-                 decode_length,
-                 beam_size=1,
-                 top_beams=1,
-                 alpha=1.0):
+                     features,
+                     decode_length,
+                     beam_size=1,
+                     top_beams=1,
+                     alpha=1.0):
         if self._num_datashards != 1:
             raise NotImplementedError("Fast decoding only supports a single shard.")
         dp = self._data_parallelism
@@ -602,3 +602,180 @@ def discourse_aware_transformer_encoder_with_context(encoder_input, encoder_self
                 encoder_output = common_layers.layer_postprocess(encoder_output, _y, hparams)
 
     return common_layers.layer_preprocess(encoder_output, hparams)
+
+
+@t2t_registry.register_model
+class HierarchicalContextTransformer(DiscourseAwareTransformer):
+
+    def encode(self, inputs, contexts, target_space, hparams, features=None, losses=None):
+        inputs = common_layers.flatten4d3d(inputs)
+        _contexts = {}
+        for context_name in contexts:
+            _contexts[context_name] = common_layers.flatten4d3d(contexts[context_name])
+
+        encoder_input, self_attention_bias, encoder_decoder_attention_bias = (
+            transformer_prepare_encoder(inputs, target_space, hparams, features=features))
+        encoder_input = tf.nn.dropout(encoder_input, 1.0 - hparams.layer_prepostprocess_dropout)
+
+        context_inputs = {}
+        self_ctxt_attention_biases = {}
+        encoder_decoder_ctxt_attention_biases = {}
+
+        for context_name in _contexts:
+            with tf.variable_scope(tf.get_variable_scope(), reuse=tf.AUTO_REUSE):
+                context_input, self_ctxt_attention_bias, encoder_decoder_ctxt_attention_bias = (
+                    transformer_prepare_encoder(_contexts[context_name], target_space, hparams, features=features)
+                )
+                context_input = tf.nn.dropout(context_input, 1.0 - hparams.layer_prepostprocess_dropout)
+                context_inputs[context_name] = context_input
+                self_ctxt_attention_biases[context_name] = self_ctxt_attention_bias
+                encoder_decoder_ctxt_attention_biases[context_name] = encoder_decoder_ctxt_attention_bias
+
+        encoder_output = hierarchical_context_encoder(encoder_input, self_attention_bias,
+                                                      context_inputs, self_ctxt_attention_biases,
+                                                      features,
+                                                      hparams,
+                                                      save_weights_to=self.attention_weights,
+                                                      losses=losses)
+        return encoder_output, self_attention_bias
+
+
+def hierarchical_context_encoder(encoder_input, encoder_self_attention_bias,
+                                 contexts, context_self_attention_biases,
+                                 features,
+                                 hparams,
+                                 name="discourse_aware_encoder",
+                                 save_weights_to=None,
+                                 make_image_summary=True,
+                                 losses=None):
+    input_x = encoder_input
+    context_xs = {}
+    for context_name in contexts:
+        context_xs[context_name] = contexts[context_name]
+    context_paddings = {}
+    context_nonpaddings = {}
+    context_pad_removers = {}
+
+    attention_dropout_broadcast_dims = (
+        common_layers.comma_separated_string_to_integer_list(
+            getattr(hparams, "attention_dropout_broadcast_dims", "")))
+
+    with tf.variable_scope(name, reuse=tf.AUTO_REUSE):
+        input_padding = common_attention.attention_bias_to_padding(encoder_self_attention_bias)
+        input_nonpadding = 1.0 - input_padding
+        for context_name in context_self_attention_biases:
+            context_paddings[context_name] = common_attention.attention_bias_to_padding(
+                context_self_attention_biases[context_name])
+            context_nonpaddings[context_name] = 1.0 - context_paddings[context_name]
+
+        input_pad_remover = None
+        for context_name in context_paddings:
+            context_pad_removers[context_name] = None
+        if hparams.use_pad_remover and not common_layers.is_xla_compiled():
+            input_pad_remover = expert_utils.PadRemover(input_padding)
+            for context_name in context_paddings:
+                context_pad_removers[context_name] = expert_utils.PadRemover(context_paddings[context_name])
+
+        temp_hparam = tf.contrib.training.HParams()  # copy hparams except num_hidden_layers -> num_hidden_layers - 1
+        for key, val in hparams.values().items():
+            temp_hparam.add_hparam(key, val)
+        temp_hparam.set_hparam("num_hidden_layers", hparams.num_hidden_layers - 1)
+        encoder_output = transformer_with_contexts_layers.transformer_encoder(
+            input_x, encoder_self_attention_bias, temp_hparam,
+            nonpadding=features_to_nonpadding(features, "inputs"),
+            save_weights_to=save_weights_to, make_image_summary=make_image_summary)
+
+        context_encoded_outputs = {}
+        for context_name in context_xs:
+            context_encoded_outputs[context_name] = transformer_with_contexts_layers.transformer_encoder(
+                context_xs[context_name], context_self_attention_biases[context_name],
+                temp_hparam, nonpadding=features_to_nonpadding(features, context_name),
+                save_weights_to=save_weights_to, make_image_summary=make_image_summary)
+
+        with tf.variable_scope("hierarchical_context_encoder", reuse=tf.AUTO_REUSE):
+            for context_name in context_encoded_outputs:
+                # self attention feed-forward
+                _y = ffn_self_attention_layer(
+                    context_encoded_outputs[context_name], hparams.hidden_size,
+                    hparams.hidden_size, hparams.num_heads, hparams.attention_dropout,
+                    save_weights_to=save_weights_to,
+                    name="attentive_sum")
+                # mean over sequence length
+                context_encoded_outputs[context_name] = tf.reduce_mean(_y, axis=1, keep_dims=True)
+
+            encoded_contexts = [context_encoded_outputs[context_name] for context_name in context_encoded_outputs]
+            encoded_contexts = tf.concat(encoded_contexts, axis=1)
+
+            temp_hparam = tf.contrib.training.HParams()  # copy hparams except num_hidden_layers -> 1
+            for key, val in hparams.values().items():
+                temp_hparam.add_hparam(key, val)
+            temp_hparam.set_hparam("num_hidden_layers", 1)
+            context_padding = common_attention.embedding_to_padding(encoded_contexts)
+            ignore_padding = common_attention.attention_bias_ignore_padding(context_padding)
+
+            encoded_contexts = transformer_encoder(encoded_contexts, ignore_padding, temp_hparam)
+
+        with tf.variable_scope("encoder/layer_%d" % hparams.num_hidden_layers, reuse=tf.AUTO_REUSE):
+            with tf.variable_scope("context_input_attention"):
+                context_padding = common_attention.embedding_to_padding(encoded_contexts)
+                ignore_padding = common_attention.attention_bias_ignore_padding(context_padding)
+                _y = common_attention.multihead_attention(
+                    common_layers.layer_preprocess(encoder_output, hparams),
+                    encoded_contexts,
+                    ignore_padding,
+                    hparams.attention_key_channels or hparams.hidden_size,
+                    hparams.attention_value_channels or hparams.hidden_size,
+                    hparams.hidden_size,
+                    hparams.num_heads,
+                    hparams.attention_dropout,
+                    attention_type=hparams.self_attention_type,
+                    save_weights_to=save_weights_to,
+                    make_image_summary=make_image_summary,
+                    max_relative_position=hparams.max_relative_position,
+                    dropout_broadcast_dims=attention_dropout_broadcast_dims,
+                    max_length=hparams.get("max_length"),
+                    vars_3d=hparams.get("attention_variables_3d")
+                )
+                encoded_contexts = common_layers.layer_postprocess(encoder_output, _y, hparams)
+
+            with tf.variable_scope("input_self_attention"):
+                _y = common_attention.multihead_attention(
+                    common_layers.layer_preprocess(encoder_output, hparams),
+                    None,
+                    encoder_self_attention_bias,
+                    hparams.attention_key_channels or hparams.hidden_size,
+                    hparams.attention_value_channels or hparams.hidden_size,
+                    hparams.hidden_size,
+                    hparams.num_heads,
+                    hparams.attention_dropout,
+                    attention_type=hparams.self_attention_type,
+                    save_weights_to=save_weights_to,
+                    max_relative_position=hparams.max_relative_position,
+                    make_image_summary=make_image_summary,
+                    dropout_broadcast_dims=attention_dropout_broadcast_dims,
+                    max_length=hparams.get("max_length"),
+                    vars_3d=hparams.get("attention_variables_3d")
+                )
+                encoder_output = common_layers.layer_postprocess(encoder_output, _y, hparams)
+
+            with tf.variable_scope("gated_sum"):
+                _depth = common_layers.shape_list(encoder_output)[-1]
+                gate = tf.layers.dense(tf.concat([encoded_contexts, encoder_output], axis=-1), _depth,
+                                       activation=tf.nn.sigmoid)
+                if save_weights_to:
+                    save_weights_to["gated_sum"] = gate
+                encoder_output = gate * encoder_output + (1. - gate) * encoded_contexts
+
+            with tf.variable_scope("ffn"):
+                _y = transformer_ffn_layer(
+                    common_layers.layer_preprocess(encoder_output, hparams),
+                    hparams,
+                    input_pad_remover,
+                    conv_padding="SAME",
+                    nonpadding_mask=input_nonpadding,
+                    losses=losses
+                )
+                encoder_output = common_layers.layer_postprocess(encoder_output, _y, hparams)
+
+    return common_layers.layer_preprocess(encoder_output, hparams)
+
